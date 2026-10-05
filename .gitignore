@@ -1,0 +1,11 @@
+.claude-worker/
+.private-bin/
+worker.log
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+/stage/
+/releases/
