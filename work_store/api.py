@@ -3,9 +3,20 @@ one `db.operation()` context (BEGIN IMMEDIATE .. COMMIT/ROLLBACK) and issues
 only parameterized SQL; it never accepts or runs caller SQL. Every row it
 inserts carries the private connection's operation_nonce so the triggers in
 schema.py can prove the insert happened inside a verified capability.
+
+Time is server-minted: no mutating call accepts an occurred_at /
+recorded_at / observed_at argument. Every timestamp an operation writes is
+the context's `now`, sampled by db.operation() AFTER BEGIN IMMEDIATE, and
+the triggers compare proof expiry against that same value (op_now()).
+
+Owner capabilities are verified only against the service-owned issuer
+attached to the connection by db.connect(); no function here accepts an
+issuer object, so a caller-constructed issuer cannot vouch for its own
+tokens.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -13,12 +24,23 @@ from typing import Any, Optional
 
 from . import db
 from .db import OperationError
-from .capability import OwnerCapabilityIssuer, CapabilityError
-from .util import now_rfc3339, canonical_json
+from .capability import CapabilityError
+from .util import canonical_json, canonical_timestamp
+
+# Proof-dict keys that would let a caller choose the clock. Rejected rather
+# than silently ignored.
+_CALLER_TIME_KEYS = ("occurred_at", "recorded_at", "observed_at")
 
 
 def _raise_op(exc: sqlite3.Error) -> None:
     raise OperationError(str(exc)) from exc
+
+
+def _caller_timestamp(value: str, field: str) -> str:
+    try:
+        return canonical_timestamp(value)
+    except ValueError as e:
+        raise OperationError(f"invalid-timestamp:{field}: {e}") from e
 
 
 def _current_tip(conn: sqlite3.Connection, item_id: str) -> Optional[sqlite3.Row]:
@@ -50,20 +72,19 @@ def _next_proof_id(conn: sqlite3.Connection) -> int:
 
 def create_item(conn: sqlite3.Connection, item_id: str, title: str, phase: str,
                  lane: str, env: str, actor: str, brief_ref: Optional[str] = None,
-                 payload: Optional[dict] = None, occurred_at: Optional[str] = None) -> dict:
-    occurred_at = occurred_at or now_rfc3339()
+                 payload: Optional[dict] = None) -> dict:
     payload_json = canonical_json(payload or {})
     try:
         with db.operation(conn, "create_item", item_id, actor) as ctx:
             conn.execute(
                 "INSERT INTO work_items(id,title,phase,lane,env,brief_ref,created_at,created_actor) "
                 "VALUES (?,?,?,?,?,?,?,?)",
-                (item_id, title, phase, lane, env, brief_ref, occurred_at, actor),
+                (item_id, title, phase, lane, env, brief_ref, ctx.now, actor),
             )
             conn.execute(
                 "INSERT INTO item_revisions(item_id,revision,prior_revision,status,payload,"
                 "occurred_at,actor,operation_nonce) VALUES (?,1,NULL,'queued',?,?,?,?)",
-                (item_id, payload_json, occurred_at, actor, ctx.nonce),
+                (item_id, payload_json, ctx.now, actor, ctx.nonce),
             )
     except sqlite3.Error as e:
         _raise_op(e)
@@ -73,14 +94,13 @@ def create_item(conn: sqlite3.Connection, item_id: str, title: str, phase: str,
 # ------------------------------------------------------------- add_dependency
 
 def add_dependency(conn: sqlite3.Connection, item_id: str, depends_on_id: str,
-                    actor: str, occurred_at: Optional[str] = None) -> None:
-    occurred_at = occurred_at or now_rfc3339()
+                    actor: str) -> None:
     try:
         with db.operation(conn, "add_dependency", item_id, actor) as ctx:
             conn.execute(
                 "INSERT INTO work_item_dependencies(item_id,depends_on_id,created_at,"
                 "created_actor,operation_nonce) VALUES (?,?,?,?,?)",
-                (item_id, depends_on_id, occurred_at, actor, ctx.nonce),
+                (item_id, depends_on_id, ctx.now, actor, ctx.nonce),
             )
     except sqlite3.Error as e:
         _raise_op(e)
@@ -89,12 +109,10 @@ def add_dependency(conn: sqlite3.Connection, item_id: str, depends_on_id: str,
 # ----------------------------------------------------------------- transition
 
 def transition(conn: sqlite3.Connection, item_id: str, expected_revision: int,
-                new_status: str, evidence: Optional[dict], actor: str,
-                occurred_at: Optional[str] = None) -> dict:
+                new_status: str, evidence: Optional[dict], actor: str) -> dict:
     """Generic CAS transition. Never touches block-resolution or completion
     fields; those require resolve_block/complete respectively. Attempting a
     queued -> active transition here is always rejected (claim-only)."""
-    occurred_at = occurred_at or now_rfc3339()
     prior = _current_tip(conn, item_id)
     payload_json = canonical_json(evidence) if evidence is not None else (
         prior["payload"] if prior is not None else "{}"
@@ -106,7 +124,7 @@ def transition(conn: sqlite3.Connection, item_id: str, expected_revision: int,
                 "INSERT INTO item_revisions(item_id,revision,prior_revision,status,payload,"
                 "occurred_at,actor,operation_nonce) VALUES (?,?,?,?,?,?,?,?)",
                 (item_id, new_revision, expected_revision, new_status, payload_json,
-                 occurred_at, actor, ctx.nonce),
+                 ctx.now, actor, ctx.nonce),
             )
     except sqlite3.Error as e:
         _raise_op(e)
@@ -116,18 +134,21 @@ def transition(conn: sqlite3.Connection, item_id: str, expected_revision: int,
 # ----------------------------------------------------------------------- claim
 
 def claim(conn: sqlite3.Connection, item_id: str, expected_revision: int,
-          proof: dict, actor: str, occurred_at: Optional[str] = None) -> dict:
+          proof: dict, actor: str) -> dict:
     """queued -> active. Mints one fresh root dispatch proof, then the active
-    revision referencing it, atomically, in the same operation_nonce."""
-    occurred_at = occurred_at or now_rfc3339()
+    revision referencing it, atomically, in the same operation_nonce. The
+    proof's recorded/observed time and the revision's occurred_at are the
+    server-minted transaction now; the trigger requires
+    valid_until >= that now, so an expired proof can never be admitted."""
+    supplied = [k for k in _CALLER_TIME_KEYS if k in proof]
+    if supplied:
+        raise OperationError(f"caller-supplied-time-forbidden: {supplied}")
     new_revision = expected_revision + 1
     proof_kind = proof["proof_kind"]
     proof_value = proof["proof_value"]
     host_id = proof.get("host_id")
     issued_actor = proof.get("issued_actor", actor)
-    recorded_at = proof.get("recorded_at", occurred_at)
-    observed_at = proof.get("observed_at", occurred_at)
-    valid_until = proof["valid_until"]
+    valid_until = _caller_timestamp(proof["valid_until"], "valid_until")
     observation = proof.get("observation", "live")
     observer_actor = proof.get("observer_actor", actor)
     prior = _current_tip(conn, item_id)
@@ -140,12 +161,12 @@ def claim(conn: sqlite3.Connection, item_id: str, expected_revision: int,
                 "proof_kind,proof_value,host_id,issued_actor,recorded_at,observed_at,valid_until,"
                 "observation,observer_actor,operation_nonce) VALUES (?,?,NULL,?,?,?,?,?,?,?,?,?,?,?)",
                 (proof_id, item_id, proof_id, proof_kind, proof_value, host_id, issued_actor,
-                 recorded_at, observed_at, valid_until, observation, observer_actor, ctx.nonce),
+                 ctx.now, ctx.now, valid_until, observation, observer_actor, ctx.nonce),
             )
             conn.execute(
                 "INSERT INTO item_revisions(item_id,revision,prior_revision,status,payload,"
                 "occurred_at,actor,operation_nonce,dispatch_root_id) VALUES (?,?,?,'active',?,?,?,?,?)",
-                (item_id, new_revision, expected_revision, payload_json, occurred_at, actor,
+                (item_id, new_revision, expected_revision, payload_json, ctx.now, actor,
                  ctx.nonce, proof_id),
             )
     except sqlite3.Error as e:
@@ -156,12 +177,12 @@ def claim(conn: sqlite3.Connection, item_id: str, expected_revision: int,
 # ------------------------------------------------------- append_proof_observation
 
 def append_proof_observation(conn: sqlite3.Connection, item_id: str, previous_proof_id: int,
-                              observation: str, actor: str, observed_at: Optional[str] = None,
-                              valid_until: Optional[str] = None,
-                              recorded_at: Optional[str] = None) -> dict:
-    observed_at = observed_at or now_rfc3339()
-    valid_until = valid_until or observed_at
-    recorded_at = recorded_at or observed_at
+                              observation: str, actor: str,
+                              valid_until: Optional[str] = None) -> dict:
+    """Recorded/observed time is the server-minted transaction now;
+    valid_until defaults to that same instant."""
+    if valid_until is not None:
+        valid_until = _caller_timestamp(valid_until, "valid_until")
     cur = conn.execute("SELECT * FROM dispatch_proofs WHERE proof_id=?", (previous_proof_id,))
     prev = cur.fetchone()
     if prev is None:
@@ -178,7 +199,7 @@ def append_proof_observation(conn: sqlite3.Connection, item_id: str, previous_pr
                 "observation,observer_actor,operation_nonce) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (proof_id, item_id, previous_proof_id, prev_map["root_proof_id"],
                  prev_map["proof_kind"], prev_map["proof_value"], prev_map["host_id"],
-                 prev_map["issued_actor"], recorded_at, observed_at, valid_until,
+                 prev_map["issued_actor"], ctx.now, ctx.now, valid_until or ctx.now,
                  observation, actor, ctx.nonce),
             )
     except sqlite3.Error as e:
@@ -189,9 +210,7 @@ def append_proof_observation(conn: sqlite3.Connection, item_id: str, previous_pr
 # -------------------------------------------------------------- request_block
 
 def request_block(conn: sqlite3.Connection, item_id: str, expected_revision: int,
-                   decision_ref: str, text: str, actor: str,
-                   occurred_at: Optional[str] = None) -> dict:
-    occurred_at = occurred_at or now_rfc3339()
+                   decision_ref: str, text: str, actor: str) -> dict:
     new_revision = expected_revision + 1
     prior = _current_tip(conn, item_id)
     payload_json = prior["payload"] if prior is not None else "{}"
@@ -201,8 +220,8 @@ def request_block(conn: sqlite3.Connection, item_id: str, expected_revision: int
                 "INSERT INTO item_revisions(item_id,revision,prior_revision,status,payload,"
                 "occurred_at,actor,operation_nonce,block_decision_ref,block_decision_text,"
                 "block_requested_on) VALUES (?,?,?,'blocked',?,?,?,?,?,?,?)",
-                (item_id, new_revision, expected_revision, payload_json, occurred_at, actor,
-                 ctx.nonce, decision_ref, text, occurred_at),
+                (item_id, new_revision, expected_revision, payload_json, ctx.now, actor,
+                 ctx.nonce, decision_ref, text, ctx.now),
             )
     except sqlite3.Error as e:
         _raise_op(e)
@@ -212,14 +231,14 @@ def request_block(conn: sqlite3.Connection, item_id: str, expected_revision: int
 # -------------------------------------------------------------- resolve_block
 
 def resolve_block(conn: sqlite3.Connection, item_id: str, expected_revision: int,
-                   exact_ref: str, resolution: dict, owner_capability: str,
-                   issuer: OwnerCapabilityIssuer, occurred_at: Optional[str] = None) -> dict:
+                   exact_ref: str, resolution: dict, owner_capability: str) -> dict:
     """resolution = {"new_status": "queued"|"superseded"|"cancelled",
-    "text": str, "actor": str}. The owner_capability token is verified and
+    "text": str, "actor": str}. The owner_capability token is verified
+    against the SERVICE-OWNED issuer (db.owner_capability_issuer) and
     reserved BEFORE the transaction opens; finalized on commit, released on
     rollback (design section 1: transaction-scoped, unforgeable, with
     rollback/replay semantics)."""
-    occurred_at = occurred_at or now_rfc3339()
+    issuer = db.owner_capability_issuer(conn)
     new_status = resolution["new_status"]
     resolution_text = resolution["text"]
     resolution_actor = resolution["actor"]
@@ -240,7 +259,7 @@ def resolve_block(conn: sqlite3.Connection, item_id: str, expected_revision: int
                 "occurred_at,actor,operation_nonce,resolved_decision_ref,resolved_on,"
                 "resolution_text,resolution_actor) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (item_id, new_revision, expected_revision, new_status, payload_json,
-                 occurred_at, resolution_actor, ctx.nonce, exact_ref, occurred_at,
+                 ctx.now, resolution_actor, ctx.nonce, exact_ref, ctx.now,
                  resolution_text, resolution_actor),
             )
     except sqlite3.Error as e:
@@ -257,8 +276,7 @@ def resolve_block(conn: sqlite3.Connection, item_id: str, expected_revision: int
 # -------------------------------------------------------------------- add_note
 
 def add_note(conn: sqlite3.Connection, item_id: str, expected_revision: int,
-             note: str, actor: str, occurred_at: Optional[str] = None) -> None:
-    occurred_at = occurred_at or now_rfc3339()
+             note: str, actor: str) -> None:
     tip = _current_tip(conn, item_id)
     if tip is None or tip["revision"] != expected_revision:
         raise OperationError("stale-version")
@@ -267,7 +285,7 @@ def add_note(conn: sqlite3.Connection, item_id: str, expected_revision: int,
             conn.execute(
                 "INSERT INTO item_events(item_id,revision,occurred_at,actor,event_type,detail) "
                 "VALUES (?,?,?,?,'operator-note',?)",
-                (item_id, expected_revision, occurred_at, actor, note),
+                (item_id, expected_revision, ctx.now, actor, note),
             )
     except sqlite3.Error as e:
         _raise_op(e)
@@ -276,9 +294,8 @@ def add_note(conn: sqlite3.Connection, item_id: str, expected_revision: int,
 # ---------------------------------------------------------------------- complete
 
 def complete(conn: sqlite3.Connection, item_id: str, expected_revision: int,
-             completion: dict, actor: str, occurred_at: Optional[str] = None,
-             owner_capability: Optional[str] = None,
-             issuer: Optional[OwnerCapabilityIssuer] = None) -> dict:
+             completion: dict, actor: str,
+             owner_capability: Optional[str] = None) -> dict:
     """completion is one of:
       {"successor_title": str, "successor_lane": str, "successor_env": str,
        "successor_brief_ref": str|None}          -> gated/plain successor arm
@@ -286,12 +303,15 @@ def complete(conn: sqlite3.Connection, item_id: str, expected_revision: int,
       {"exception_kind": "owner-decision", "reason": str,
        "decision_date": str, "decision_ref": str}
     The service -- never the caller -- selects the fresh successor UUID.
-    The owner-decision arm requires a capability token from the same
-    `issuer` used by resolve_block, scoped to operation="complete" and the
-    exact decision_ref; it is reserved before the transaction opens and
-    finalized/released exactly like resolve_block's capability.
+    The owner-decision arm requires a capability token from the
+    service-owned issuer (the same one resolve_block verifies against),
+    scoped to operation="complete" and the exact decision_ref; it is
+    reserved before the transaction opens and finalized/released exactly
+    like resolve_block's capability. Its consumption is recorded in the same
+    transaction as a 'verdict' event bound to the done revision's
+    operation_nonce, which invariant I004 requires for every owner-decision
+    completion.
     """
-    occurred_at = occurred_at or now_rfc3339()
     new_revision = expected_revision + 1
     prior = _current_tip(conn, item_id)
     payload_json = prior["payload"] if prior is not None else "{}"
@@ -310,10 +330,11 @@ def complete(conn: sqlite3.Connection, item_id: str, expected_revision: int,
     try:
         if exception_kind == "owner-decision":
             reason = completion["reason"]
-            decision_date = completion["decision_date"]
+            decision_date = _caller_timestamp(completion["decision_date"], "decision_date")
             decision_ref = completion["decision_ref"]
-            if issuer is None or owner_capability is None:
+            if owner_capability is None:
                 raise OperationError("owner-decision-capability-required")
+            issuer = db.owner_capability_issuer(conn)
             try:
                 issuer.reserve(owner_capability, item_id, expected_revision, decision_ref, "complete")
             except CapabilityError as e:
@@ -326,8 +347,20 @@ def complete(conn: sqlite3.Connection, item_id: str, expected_revision: int,
                         "occurred_at,actor,operation_nonce,exception_kind,exception_reason,"
                         "exception_decision_date,exception_decision_ref) "
                         "VALUES (?,?,?,'done',?,?,?,?,?,?,?,?)",
-                        (item_id, new_revision, expected_revision, payload_json, occurred_at, actor,
+                        (item_id, new_revision, expected_revision, payload_json, ctx.now, actor,
                          ctx.nonce, exception_kind, reason, decision_date, decision_ref),
+                    )
+                    conn.execute(
+                        "INSERT INTO item_events(item_id,revision,occurred_at,actor,event_type,"
+                        "detail,metadata) VALUES (?,?,?,?,'verdict',?,?)",
+                        (item_id, new_revision, ctx.now, actor, "owner-capability-consumed",
+                         canonical_json({
+                             "capability": "owner-decision",
+                             "decision_ref": decision_ref,
+                             "operation_nonce": ctx.nonce,
+                             "token_sha256": hashlib.sha256(
+                                 owner_capability.encode("utf-8")).hexdigest(),
+                         })),
                     )
             except sqlite3.Error:
                 issuer.release(owner_capability)
@@ -344,7 +377,7 @@ def complete(conn: sqlite3.Connection, item_id: str, expected_revision: int,
                     "INSERT INTO item_revisions(item_id,revision,prior_revision,status,payload,"
                     "occurred_at,actor,operation_nonce,exception_kind,exception_reason) "
                     "VALUES (?,?,?,'done',?,?,?,?,?,?)",
-                    (item_id, new_revision, expected_revision, payload_json, occurred_at, actor,
+                    (item_id, new_revision, expected_revision, payload_json, ctx.now, actor,
                      ctx.nonce, exception_kind, reason),
                 )
         else:
@@ -357,20 +390,20 @@ def complete(conn: sqlite3.Connection, item_id: str, expected_revision: int,
                     "VALUES (?,?,?,?,?,?,?,?)",
                     (successor_id, completion["successor_title"], successor_phase,
                      completion["successor_lane"], completion["successor_env"],
-                     completion.get("successor_brief_ref"), occurred_at, actor),
+                     completion.get("successor_brief_ref"), ctx.now, actor),
                 )
                 conn.execute(
                     "INSERT INTO item_revisions(item_id,revision,prior_revision,status,payload,"
                     "occurred_at,actor,operation_nonce,successor_owner_item_id,"
                     "successor_owner_revision,successor_owner_nonce) "
                     "VALUES (?,1,NULL,'queued','{}',?,?,?,?,?,?)",
-                    (successor_id, occurred_at, actor, ctx.nonce, item_id, new_revision, ctx.nonce),
+                    (successor_id, ctx.now, actor, ctx.nonce, item_id, new_revision, ctx.nonce),
                 )
                 conn.execute(
                     "INSERT INTO item_revisions(item_id,revision,prior_revision,status,payload,"
                     "occurred_at,actor,operation_nonce,completion_successor_id,"
                     "completion_successor_phase) VALUES (?,?,?,'done',?,?,?,?,?,?)",
-                    (item_id, new_revision, expected_revision, payload_json, occurred_at, actor,
+                    (item_id, new_revision, expected_revision, payload_json, ctx.now, actor,
                      ctx.nonce, successor_id, successor_phase),
                 )
     except sqlite3.Error as e:

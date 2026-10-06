@@ -173,10 +173,7 @@ def cmd_prepare_legacy_downgrade(args) -> int:
 
         _atomic_write(os.path.join(args.out, "projection.json"), canonical_json_bytes(projection))
         _atomic_write(os.path.join(args.out, "watermark.json"), canonical_json_bytes(watermark_after))
-        roundtrip_path = os.path.join(args.out, "roundtrip.db")
-        disk = sqlite3.connect(roundtrip_path)
-        roundtrip_conn.backup(disk)
-        disk.close()
+        legacy.atomic_backup(roundtrip_conn, os.path.join(args.out, "roundtrip.db"))
 
         conn.execute("COMMIT")
         print(f"OK: staged to {args.out} (schema_version={watermark_after['schema_version']})")
@@ -260,8 +257,14 @@ def cmd_compare_canonical(args) -> int:
 
 
 def cmd_heartbeat(args) -> int:
-    conn = sqlite3.connect(args.db)
     try:
+        conn = sqlite3.connect(args.db)
+    except sqlite3.Error as e:
+        print(f"D000: invariant-query-failed -- {e}")
+        return EXIT_QUERY_FAILED
+    try:
+        # P001 always runs: compute_quiet checks the compiled reference
+        # fingerprint when no explicit one is pinned.
         result = compute_quiet(conn, now_rfc3339())
     finally:
         conn.close()
@@ -269,7 +272,11 @@ def cmd_heartbeat(args) -> int:
         print("all quiet")
     else:
         for d in result.diagnostics:
-            print(f"{d.id}: {d.reason} -- {d.detail}")
+            print(f"{d.diag_id}: {d.subject} -- {d.detail}")
+        if result.four_field:
+            active, eligible, blocked, pollable = result.four_field
+            print(f"not quiet: active={active} eligible_queued={eligible} "
+                  f"blocked={blocked} pollable_external={pollable}")
     return result.exit_code
 
 

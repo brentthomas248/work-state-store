@@ -9,6 +9,9 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Optional
 
+from .capability import OwnerCapabilityIssuer
+from .util import now_rfc3339
+
 CANONICAL_TABLES = {
     "schema_version",
     "schema_migrations",
@@ -52,11 +55,21 @@ class OperationContext:
     decision_ref: Optional[str] = None
     successor_id: Optional[str] = None
     detail: Optional[str] = None
+    # Server-minted transaction time, sampled AFTER BEGIN IMMEDIATE acquires
+    # the write lock. Every timestamp the operation writes, and every
+    # expiry comparison the triggers make (op_now()), uses this value; it
+    # is never accepted from the caller.
+    now: Optional[str] = None
 
 
 class _ContextHolder:
     def __init__(self) -> None:
         self.current: Optional[OperationContext] = None
+        # Service-owned owner-capability verifier. Constructed here, with a
+        # secret generated here, when the service opens its connection; the
+        # typed API reads it from this private holder and never accepts an
+        # issuer object from its caller.
+        self.owner_issuer = OwnerCapabilityIssuer()
 
 
 class StoreConnection(sqlite3.Connection):
@@ -131,6 +144,7 @@ def connect(path: str) -> sqlite3.Connection:
     conn.create_function("op_nonce", 0, lambda: holder.current and holder.current.nonce, deterministic=False)
     conn.create_function("actor_context", 0, lambda: holder.current and holder.current.actor, deterministic=False)
     conn.create_function("event_detail_context", 0, lambda: holder.current and holder.current.detail, deterministic=False)
+    conn.create_function("op_now", 0, lambda: holder.current and holder.current.now, deterministic=False)
 
     conn.set_authorizer(_authorizer_factory(holder))
     return conn
@@ -138,6 +152,22 @@ def connect(path: str) -> sqlite3.Connection:
 
 def mint_nonce() -> str:
     return secrets.token_hex(32)
+
+
+def _server_now() -> str:
+    """The service clock. Indirection point so tests can advance server
+    time; callers of the typed API have no way to influence it."""
+    return now_rfc3339()
+
+
+def owner_capability_issuer(conn: sqlite3.Connection) -> OwnerCapabilityIssuer:
+    """Owner-side issuance channel for this service connection's capability
+    verifier. The typed API (api.py) verifies tokens ONLY against this
+    service-owned issuer; tokens signed by any other issuer instance fail
+    signature verification. In this single-process build the owner channel
+    is an in-process function rather than a separate authenticated socket
+    (see BUILD-REPORT.md, STAYS PROSE)."""
+    return conn._op_holder.owner_issuer  # type: ignore[attr-defined]
 
 
 def checkpoint(path: str) -> None:
@@ -171,8 +201,13 @@ def operation(conn: sqlite3.Connection, kind: str, item_id: str, actor: str,
         successor_id=successor_id, detail=detail,
     )
     holder.current = ctx
-    conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("BEGIN IMMEDIATE")
+    except Exception:
+        holder.current = None
+        raise
+    try:
+        ctx.now = _server_now()
         yield ctx
         conn.execute("COMMIT")
     except Exception:

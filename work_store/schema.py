@@ -262,7 +262,7 @@ CREATE TRIGGER revision_insert_contract BEFORE INSERT ON item_revisions BEGIN
   SELECT 1 FROM dispatch_proofs p WHERE p.proof_id=NEW.dispatch_root_id
    AND p.item_id=NEW.item_id AND p.proof_id=p.root_proof_id
    AND p.previous_proof_id IS NULL AND p.observation='live'
-   AND p.valid_until>=NEW.occurred_at AND p.operation_nonce=op_nonce()
+   AND p.valid_until>=op_now() AND p.operation_nonce=op_nonce()
    AND NOT EXISTS(SELECT 1 FROM dispatch_proofs n
     WHERE n.previous_proof_id=p.proof_id)
    AND 1=(SELECT count(*) FROM dispatch_proofs tip
@@ -323,6 +323,12 @@ CREATE TRIGGER revision_insert_contract BEFORE INSERT ON item_revisions BEGIN
   (op_kind()<>'complete' OR op_decision_ref() IS NULL OR
    NEW.exception_decision_ref<>op_decision_ref())
   THEN RAISE(ABORT,'owner-decision-capability-required') END;
+
+ /* Transaction time is server-minted: op_now() is sampled by the service
+    after BEGIN IMMEDIATE and is the only clock the expiry check above uses.
+    A revision may not carry any other occurred_at. */
+ SELECT CASE WHEN op_now() IS NULL OR NEW.occurred_at<>op_now()
+  THEN RAISE(ABORT,'occurred-at-not-server-minted') END;
 END;
 
 CREATE TRIGGER revision_insert_event AFTER INSERT ON item_revisions BEGIN
@@ -348,6 +354,8 @@ CREATE TRIGGER proof_insert_contract BEFORE INSERT ON dispatch_proofs BEGIN
  SELECT CASE WHEN NEW.previous_proof_id IS NULL AND EXISTS(
   SELECT 1 FROM current_items c WHERE c.id=NEW.item_id AND c.status='active')
   THEN RAISE(ABORT,'active-item-proof-root-substitution') END;
+ SELECT CASE WHEN op_now() IS NULL OR NEW.recorded_at<>op_now()
+  THEN RAISE(ABORT,'recorded-at-not-server-minted') END;
 END;
 CREATE TRIGGER proof_insert_event AFTER INSERT ON dispatch_proofs BEGIN
  INSERT INTO item_events(item_id,occurred_at,actor,event_type,detail,metadata)

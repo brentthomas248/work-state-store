@@ -7,7 +7,6 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from work_store import api, db, migrate
-from work_store.capability import OwnerCapabilityIssuer
 from work_store.db import OperationError
 from work_store.util import now_rfc3339
 
@@ -22,7 +21,8 @@ class StoreTestCase(unittest.TestCase):
         self.migration_checksum = migrate.apply_schema(raw, now_rfc3339(), "test-actor")
         raw.close()
         self.conn = db.connect(self.db_path)
-        self.issuer = OwnerCapabilityIssuer()
+        # The service-owned issuer (owner channel); the typed API never takes it.
+        self.issuer = db.owner_capability_issuer(self.conn)
 
     def tearDown(self) -> None:
         self.conn.close()

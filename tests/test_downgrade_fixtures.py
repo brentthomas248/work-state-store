@@ -139,8 +139,14 @@ class DowngradeEndToEndCommandChainTests(unittest.TestCase):
 
         proc = self._run("heartbeat", "--db", os.path.join(out_dir, "roundtrip.db"),
                           "--once", "--no-external")
-        self.assertEqual(proc.returncode, cli.EXIT_OK, proc.stdout + proc.stderr)
-        self.assertIn("all quiet", proc.stdout)
+        # The baseline legitimately carries eligible queued work (and an
+        # external-lane item), so the honest heartbeat answer is "not quiet"
+        # (exit 20) with the counts printed -- and zero diagnostics: no
+        # invariant, P001 fingerprint, or D000 failure on the roundtrip db.
+        self.assertEqual(proc.returncode, 20, proc.stdout + proc.stderr)
+        self.assertIn("not quiet: active=0 eligible_queued=", proc.stdout)
+        self.assertNotRegex(proc.stdout, r"\b[IPD]\d{3}:")
+        self.assertNotIn("all quiet", proc.stdout)
 
     def test_unrepresentable_reader_refuses_with_no_staged_output_and_source_untouched(self):
         out_dir = os.path.join(self.stage_root, "stage_refused")

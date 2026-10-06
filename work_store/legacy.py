@@ -10,16 +10,39 @@ rebuild tool that runs before any service ever opens the file, exactly like
 `migrate.apply_schema`, so it does not go through `db.connect()`'s
 authorizer/operation-context machinery (there is no live operation to bind
 to; the rows being replayed already carry their original audit trail).
+The six insert-contract/event triggers it suspends for the literal replay
+are recreated from their exact stored SQL before commit, and the rebuilt
+database's full trigger set is verified against a fresh schema-3 artifact,
+so an imported database enforces exactly what a migrated one does.
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 
 from . import migrate
 from .util import canonical_hash, canonical_json, now_rfc3339
 
 ENCODING = "work-state-v3-extension/1"
+
+# Suspended only for the duration of the offline replay; always recreated.
+_REPLAY_SUSPENDED_TRIGGERS = (
+    "dependency_insert_contract", "dependency_insert_event",
+    "revision_insert_contract", "revision_insert_event",
+    "proof_insert_contract", "proof_insert_event",
+)
+
+
+class ImportIntegrityError(Exception):
+    """The rebuilt database does not carry the full schema-3 enforcement
+    artifact set."""
+
+
+def _trigger_sql(conn: sqlite3.Connection) -> dict:
+    return dict(conn.execute(
+        "SELECT name, sql FROM sqlite_schema WHERE type='trigger' ORDER BY name"
+    ).fetchall())
 
 _REVISION_COLUMNS = [
     "item_id", "revision", "prior_revision", "status", "payload",
@@ -210,11 +233,10 @@ def import_legacy(projection: dict, applied_at: str | None = None, actor: str = 
     # replayed already carry their own historical item_events rows in the
     # projection -- so the *_contract (BEFORE) triggers, which gate on a live
     # operation context, and the *_event (AFTER) triggers, which would
-    # otherwise synthesize a SECOND, duplicate event row, are both dropped
-    # for this trusted, offline, literal replay.
-    for trigger in ("dependency_insert_contract", "dependency_insert_event",
-                     "revision_insert_contract", "revision_insert_event",
-                     "proof_insert_contract", "proof_insert_event"):
+    # otherwise synthesize a SECOND, duplicate event row, are suspended for
+    # this offline, literal replay and recreated verbatim afterwards.
+    expected_triggers = _trigger_sql(conn)
+    for trigger in _REPLAY_SUSPENDED_TRIGGERS:
         conn.execute(f"DROP TRIGGER {trigger}")
 
     for item in projection["items"]:
@@ -258,16 +280,52 @@ def import_legacy(projection: dict, applied_at: str | None = None, actor: str = 
                 (e["event_id"], e["item_id"], e["revision"], e["occurred_at"], e["actor"],
                  e["event_type"], e["detail"], metadata_text),
             )
+    for trigger in _REPLAY_SUSPENDED_TRIGGERS:
+        conn.execute(expected_triggers[trigger])
+    actual_triggers = _trigger_sql(conn)
+    if actual_triggers != expected_triggers:
+        missing = sorted(set(expected_triggers) - set(actual_triggers))
+        changed = sorted(n for n in expected_triggers
+                         if n in actual_triggers and actual_triggers[n] != expected_triggers[n])
+        conn.rollback()
+        conn.close()
+        raise ImportIntegrityError(f"trigger set mismatch: missing={missing} changed={changed}")
     conn.commit()
     return conn
 
 
+def atomic_backup(conn: sqlite3.Connection, db_path: str) -> None:
+    """Write a SQLite backup of `conn` to `db_path` durably and atomically:
+    back up to a sibling temp file, fsync it, os.replace() it into place,
+    then fsync the directory. A reader never observes a partial file."""
+    tmp = db_path + ".tmp"
+    for ext in ("", "-journal", "-wal", "-shm"):
+        if os.path.exists(tmp + ext):
+            os.remove(tmp + ext)
+    disk = sqlite3.connect(tmp)
+    try:
+        conn.backup(disk)
+    finally:
+        disk.close()
+    fd = os.open(tmp, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, db_path)
+    dir_fd = os.open(os.path.dirname(os.path.abspath(db_path)) or ".", os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def import_legacy_to_file(projection: dict, db_path: str, **kwargs) -> None:
     mem = import_legacy(projection, **kwargs)
-    disk = sqlite3.connect(db_path)
-    mem.backup(disk)
-    disk.close()
-    mem.close()
+    try:
+        atomic_backup(mem, db_path)
+    finally:
+        mem.close()
 
 
 def _diffs(left: dict, right: dict) -> list[dict]:

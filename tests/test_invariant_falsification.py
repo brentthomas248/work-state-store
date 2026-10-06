@@ -201,7 +201,7 @@ class InvariantFalsificationTests(StoreTestCase):
         api.resolve_block(
             self.conn, item, 3, "DEC-2",
             {"new_status": "queued", "text": "resolved", "actor": "owner"},
-            self.issuer.issue(item, 3, "DEC-2"), self.issuer,
+            self.issuer.issue(item, 3, "DEC-2"),
         )
         corrupt = self._corrupt(["revisions_no_update"])
         corrupt.execute(
@@ -232,7 +232,7 @@ class InvariantFalsificationTests(StoreTestCase):
         claimed = self.claim_item(item, expected_revision=1)
         api.append_proof_observation(
             self.conn, item, claimed["proof_id"], "live", "tester",
-            observed_at=now_rfc3339(), valid_until="2999-01-01T00:00:00.000000Z",
+            valid_until="2999-01-01T00:00:00.000000Z",
         )
         corrupt = self._corrupt(["proofs_no_update"])
         corrupt.execute(

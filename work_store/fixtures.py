@@ -11,7 +11,6 @@ import sqlite3
 import tempfile
 
 from . import api, db, migrate
-from .capability import OwnerCapabilityIssuer
 from .util import now_rfc3339
 
 
@@ -23,7 +22,7 @@ def build_baseline_conn() -> sqlite3.Connection:
     migrate.apply_schema(raw, now_rfc3339(), "fixture-builder")
     raw.close()
     conn = db.connect(path)
-    issuer = OwnerCapabilityIssuer()
+    issuer = db.owner_capability_issuer(conn)
 
     # A: queued -> active -> done (gated successor arm), Unicode title/payload.
     api.create_item(conn, "A", "Tëst item → 日本語 💥", "design-accepted", "operator", "local",
@@ -49,7 +48,7 @@ def build_baseline_conn() -> sqlite3.Connection:
     token = issuer.issue("D", 2, "DEC-OWNER-1", operation="complete")
     api.complete(conn, "D", 2, {"exception_kind": "owner-decision", "reason": "owner override",
                                 "decision_date": now_rfc3339(), "decision_ref": "DEC-OWNER-1"},
-                 "tester", owner_capability=token, issuer=issuer)
+                 "tester", owner_capability=token)
 
     # E/F: dependency tuple (added while both revision-1/queued), then E is
     # claimed, revoked-then-reclaimed proof history, blocked, and resolved
@@ -61,12 +60,12 @@ def build_baseline_conn() -> sqlite3.Connection:
                                        "host_id": "host-3",
                                        "valid_until": "2999-01-01T00:00:00.000000Z"}, "tester")
     api.append_proof_observation(conn, "E", claimed["proof_id"], "revoked", "tester",
-                                  observed_at=now_rfc3339(), valid_until="2999-01-01T00:00:00.000000Z")
+                                  valid_until="2999-01-01T00:00:00.000000Z")
     api.request_block(conn, "E", 2, "DEC-BLOCK-1", "need a call", "tester")
     block_token = issuer.issue("E", 3, "DEC-BLOCK-1")
     api.resolve_block(conn, "E", 3, "DEC-BLOCK-1",
                        {"new_status": "queued", "text": "resolved, proceed", "actor": "owner"},
-                       block_token, issuer)
+                       block_token)
 
     # G: queued -> cancelled (terminal sink, no gate/claim involved).
     api.create_item(conn, "G", "item G", "design-accepted", "operator", "local", "tester")

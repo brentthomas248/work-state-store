@@ -4,6 +4,7 @@ silence (design section 4). IDs are permanent; never renumber them.
 """
 from __future__ import annotations
 
+import functools
 import sqlite3
 from dataclasses import dataclass
 
@@ -65,6 +66,16 @@ JOIN work_items w ON w.id=r.item_id
 WHERE r.status='done' AND r.exception_kind='final-phase' AND EXISTS(
  SELECT 1 FROM phase_gates g WHERE g.predecessor_phase=w.phase AND g.required=1)
 UNION ALL
+SELECT 'I004',r.item_id,CAST(r.revision AS TEXT) FROM item_revisions r
+WHERE r.status='done' AND r.exception_kind='owner-decision' AND
+ (r.operation_nonce IS NULL OR NOT EXISTS(
+  SELECT 1 FROM item_events e WHERE e.item_id=r.item_id AND e.revision=r.revision
+   AND e.event_type='verdict'
+   AND json_extract(e.metadata,'$.capability')='owner-decision'
+   AND json_extract(e.metadata,'$.operation_nonce')=r.operation_nonce
+   AND json_extract(e.metadata,'$.decision_ref')=r.exception_decision_ref
+   AND length(json_extract(e.metadata,'$.token_sha256'))=64))
+UNION ALL
 SELECT 'I005',r.item_id,coalesce(r.completion_successor_id,'NULL')
 FROM item_revisions r JOIN work_items p ON p.id=r.item_id
 JOIN phase_gates g ON g.predecessor_phase=p.phase AND g.required=1
@@ -80,11 +91,14 @@ UNION ALL
 SELECT 'I007',r.item_id,r.completion_successor_id FROM item_revisions r
 JOIN item_revisions c ON c.item_id=r.completion_successor_id AND c.revision=1
 WHERE r.status='done' AND (c.status<>'queued' OR c.prior_revision IS NOT NULL OR
- EXISTS(SELECT 1 FROM item_revisions c2 WHERE c2.item_id=c.item_id AND c2.revision>1))
+ EXISTS(SELECT 1 FROM item_revisions c2 WHERE c2.item_id=c.item_id AND c2.revision>1
+  AND (c2.occurred_at<=r.occurred_at OR c2.operation_nonce IS r.operation_nonce)))
 UNION ALL
 SELECT 'I008',r.item_id,r.completion_successor_id FROM item_revisions r
 JOIN item_revisions c ON c.item_id=r.completion_successor_id AND c.revision=1
-WHERE r.status='done' AND (c.successor_owner_item_id<>r.item_id OR
+WHERE r.status='done' AND (c.successor_owner_item_id IS NULL OR
+ c.successor_owner_revision IS NULL OR c.successor_owner_nonce IS NULL OR
+ r.operation_nonce IS NULL OR c.successor_owner_item_id<>r.item_id OR
  c.successor_owner_revision<>r.revision OR
  c.successor_owner_nonce<>r.operation_nonce OR EXISTS(
   SELECT 1 FROM item_revisions other WHERE other.completion_successor_id=c.item_id
@@ -171,6 +185,21 @@ def artifact_fingerprint(conn: sqlite3.Connection) -> str:
     return _p001_hash(conn)
 
 
+@functools.lru_cache(maxsize=1)
+def reference_fingerprint() -> str:
+    """P001 fingerprint of the compiled schema-3 artifact: the shipped DDL
+    template applied to a scratch in-memory database. This is the expected
+    value whenever a caller does not pin one explicitly, so P001 always
+    runs."""
+    from . import migrate
+    scratch = sqlite3.connect(":memory:")
+    try:
+        migrate.apply_schema(scratch, "1970-01-01T00:00:00.000000Z", "p001-reference")
+        return _p001_hash(scratch)
+    finally:
+        scratch.close()
+
+
 def check_policy_tables(conn: sqlite3.Connection) -> list[Diagnostic]:
     diags: list[Diagnostic] = []
     actual_st = set(conn.execute("SELECT from_status,to_status,requires_block_resolution FROM status_transitions"))
@@ -218,11 +247,14 @@ def invariant_violations(conn: sqlite3.Connection, now: str,
                           expected_fingerprint: str | None = None) -> list[Diagnostic]:
     """Run all mandatory diagnostics in one pass. Raises InvariantQueryFailed
     (D000) on any prepare/bind/step/decode failure rather than ever
-    returning a clean-but-wrong empty list."""
+    returning a clean-but-wrong empty list. P001 is mandatory: with no
+    pinned expected_fingerprint it is checked against the compiled
+    reference_fingerprint()."""
     try:
         diags: list[Diagnostic] = []
-        if expected_fingerprint is not None:
-            diags += check_schema_artifact(conn, expected_fingerprint)
+        if expected_fingerprint is None:
+            expected_fingerprint = reference_fingerprint()
+        diags += check_schema_artifact(conn, expected_fingerprint)
         diags += check_policy_tables(conn)
         diags += run_integrity_checks(conn)
         diags += run_state_invariants(conn, now)

@@ -1,10 +1,11 @@
 """Acceptance criterion B: block authority. T-BLOCK-01 plus the capability
 unforgeability/rollback/replay matrix."""
+import inspect
 import unittest
 
 from tests.helpers import StoreTestCase
 from work_store import api, db
-from work_store.capability import CapabilityError
+from work_store.capability import CapabilityError, OwnerCapabilityIssuer
 from work_store.db import OperationError
 from work_store.util import now_rfc3339
 
@@ -69,26 +70,89 @@ class BlockAuthorityTests(StoreTestCase):
         token = self.issuer.issue(item, 3, "DEC-10")
         api.resolve_block(self.conn, item, 3, "DEC-10",
                            {"new_status": "queued", "text": "ok", "actor": "owner"},
-                           token, self.issuer)
+                           token)
         with self.assertRaises(CapabilityError):
             self.issuer.reserve(token, item, 3, "DEC-10")
 
     def test_capability_released_on_rollback_is_usable_again(self):
         """Rollback/replay semantics: a reservation that never commits must
-        not permanently burn the capability."""
+        not permanently burn the capability. The token is valid for (item,
+        revision 3, DEC-11), so reserve() succeeds; the transaction then
+        fails INSIDE the database (resolution to 'done' is not a legal
+        block-resolution arc) and rolls back, which must release it."""
         item = self._blocked_item("DEC-11")
         token = self.issuer.issue(item, 3, "DEC-11")
-        # Force the transaction to fail after a valid reservation by racing
-        # a stale expected_revision (CAS will reject it).
-        with self.assertRaises(OperationError):
-            api.resolve_block(self.conn, item, 99, "DEC-11",
-                               {"new_status": "queued", "text": "ok", "actor": "owner"},
-                               token, self.issuer)
+        calls = {"reserve": 0, "release": 0, "finalize": 0}
+        real = {name: getattr(self.issuer, name) for name in calls}
+
+        def spy(name):
+            def wrapper(*a, **kw):
+                calls[name] += 1
+                return real[name](*a, **kw)
+            return wrapper
+
+        for name in calls:
+            setattr(self.issuer, name, spy(name))
+        try:
+            with self.assertRaises(OperationError):
+                api.resolve_block(self.conn, item, 3, "DEC-11",
+                                   {"new_status": "done", "text": "ok", "actor": "owner"},
+                                   token)
+        finally:
+            for name in calls:
+                delattr(self.issuer, name)
+        self.assertEqual(calls["reserve"], 1)       # a real reservation happened
+        self.assertGreater(calls["release"], 0)     # and a real rollback released it
+        self.assertEqual(calls["finalize"], 0)
+        tip = self.conn.execute("SELECT MAX(revision) FROM item_revisions WHERE item_id=?",
+                                (item,)).fetchone()[0]
+        self.assertEqual(tip, 3)                     # nothing committed
         # Capability must still be usable since nothing committed.
         result = api.resolve_block(self.conn, item, 3, "DEC-11",
                                     {"new_status": "queued", "text": "ok", "actor": "owner"},
-                                    token, self.issuer)
+                                    token)
         self.assertEqual(result["revision"], 4)
+
+    def test_caller_constructed_issuer_token_rejected_by_resolve_block(self):
+        """Reviewer probe (B): a freshly constructed OwnerCapabilityIssuer()
+        with a self-issued token must NOT authorize resolve_block -- the API
+        verifies only against the service-owned issuer."""
+        item = self._blocked_item("DEC-20")
+        rogue = OwnerCapabilityIssuer()
+        token = rogue.issue(item, 3, "DEC-20")
+        with self.assertRaises(OperationError) as cm:
+            api.resolve_block(self.conn, item, 3, "DEC-20",
+                               {"new_status": "queued", "text": "ok", "actor": "owner"},
+                               token)
+        self.assertIn("capability", str(cm.exception))
+        tip = self.conn.execute("SELECT status FROM item_revisions WHERE item_id=? "
+                                "ORDER BY revision DESC LIMIT 1", (item,)).fetchone()[0]
+        self.assertEqual(tip, "blocked")
+
+    def test_caller_constructed_issuer_token_rejected_by_complete(self):
+        """Reviewer probe (B) against complete()'s owner-decision arm."""
+        item = self.make_item(phase="misc-phase")
+        self.claim_item(item, expected_revision=1)
+        rogue = OwnerCapabilityIssuer()
+        token = rogue.issue(item, 2, "DEC-21", operation="complete")
+        with self.assertRaises(OperationError) as cm:
+            api.complete(self.conn, item, 2,
+                         {"exception_kind": "owner-decision", "reason": "r",
+                          "decision_date": now_rfc3339(), "decision_ref": "DEC-21"},
+                         "tester", owner_capability=token)
+        self.assertIn("capability", str(cm.exception))
+        tip = self.conn.execute("SELECT status FROM item_revisions WHERE item_id=? "
+                                "ORDER BY revision DESC LIMIT 1", (item,)).fetchone()[0]
+        self.assertEqual(tip, "active")
+
+    def test_api_takes_no_issuer_parameter(self):
+        """The issuer is service-owned: no typed-API entry point accepts an
+        issuer object from its caller."""
+        for fn in (api.resolve_block, api.complete):
+            self.assertNotIn("issuer", inspect.signature(fn).parameters, fn.__name__)
+        with self.assertRaises(TypeError):
+            api.resolve_block(self.conn, "x", 3, "D", {"new_status": "queued", "text": "t",
+                              "actor": "o"}, "tok", OwnerCapabilityIssuer())
 
     def test_capability_cannot_be_reserved_twice_concurrently(self):
         item = self._blocked_item("DEC-12")

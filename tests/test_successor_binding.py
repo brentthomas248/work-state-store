@@ -174,7 +174,7 @@ class SuccessorBindingTests(StoreTestCase):
             api.complete(self.conn, predecessor, 2,
                           {"exception_kind": "owner-decision", "reason": "waived",
                            "decision_date": now_rfc3339(), "decision_ref": "FORGED-REF"},
-                          "tester")  # no owner_capability/issuer supplied
+                          "tester")  # no owner_capability supplied
         self.assertIn("owner-decision-capability-required", str(cm.exception))
         self.assertEqual(_counts(self.conn), before)
 
@@ -187,7 +187,7 @@ class SuccessorBindingTests(StoreTestCase):
             api.complete(self.conn, predecessor, 2,
                          {"exception_kind": "owner-decision", "reason": "waived",
                           "decision_date": now_rfc3339(), "decision_ref": "DIFFERENT-REF"},
-                         "tester", owner_capability=token, issuer=self.issuer)
+                         "tester", owner_capability=token)
         self.assertEqual(_counts(self.conn), before)
 
 

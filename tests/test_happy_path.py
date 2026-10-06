@@ -22,7 +22,7 @@ class HappyPathTests(StoreTestCase):
         resolved = api.resolve_block(
             self.conn, item, 3, "DEC-1",
             {"new_status": "queued", "text": "approved", "actor": "owner"},
-            token, self.issuer,
+            token,
         )
         self.assertEqual(resolved["revision"], 4)
 
@@ -57,7 +57,7 @@ class HappyPathTests(StoreTestCase):
             self.conn, item, 2,
             {"exception_kind": "owner-decision", "reason": "owner waived the build gate",
              "decision_date": "2026-10-05T00:00:00.000000Z", "decision_ref": "OWNER-DEC-1"},
-            "tester", owner_capability=token, issuer=self.issuer,
+            "tester", owner_capability=token,
         )
         self.assertEqual(done["successor_id"], None)
 
@@ -82,7 +82,6 @@ class HappyPathTests(StoreTestCase):
         claimed = self.claim_item(item, expected_revision=1)
         appended = api.append_proof_observation(
             self.conn, item, claimed["proof_id"], "dead", "tester",
-            observed_at="2026-10-05T01:00:00.000000Z", valid_until="2026-10-05T01:00:00.000000Z",
         )
         self.assertIn("proof_id", appended)
 

@@ -1,8 +1,12 @@
 """Heartbeat query module (design section 4). Computed silence: `quiet` is
-true only after every diagnostic is empty, integrity and foreign keys pass,
-and the eligibility/active/blocked/pollable predicate is evaluated twice
-(same or later snapshot) with no change. Any diagnostic or query failure
+true only when BOTH passes (diagnostics + four-field predicate, repeated
+inside one read snapshot transaction) report zero diagnostics -- P001 is
+always included -- AND every numeric predicate (active, eligible queued,
+blocked, pollable external) is zero. Any diagnostic or query failure
 forces quiet=false; D000 is never silent.
+
+Exit codes: 0 quiet; 20 not quiet (diagnostics present, or outstanding
+work counted by a nonzero predicate); 30 query failure (D000).
 """
 from __future__ import annotations
 
@@ -56,20 +60,31 @@ def four_field_predicate(conn: sqlite3.Connection) -> tuple:
 
 def compute_quiet(conn: sqlite3.Connection, now: str,
                    expected_fingerprint: str | None = None) -> HeartbeatResult:
+    """expected_fingerprint pins P001; when None, P001 is still checked
+    against the compiled reference (invariants.reference_fingerprint)."""
+    own_txn = not conn.in_transaction
     try:
-        diags = invariant_violations(conn, now, expected_fingerprint)
-        first_pass = four_field_predicate(conn)
-        diags += invariant_violations(conn, now, expected_fingerprint)
-        second_pass = four_field_predicate(conn)
-    except InvariantQueryFailed as e:
+        if own_txn:
+            # Deferred read transaction: both passes observe one snapshot.
+            conn.execute("BEGIN")
+        try:
+            diags = invariant_violations(conn, now, expected_fingerprint)
+            first_pass = four_field_predicate(conn)
+            diags += invariant_violations(conn, now, expected_fingerprint)
+            second_pass = four_field_predicate(conn)
+        finally:
+            if own_txn and conn.in_transaction:
+                conn.execute("COMMIT")
+    except (InvariantQueryFailed, sqlite3.Error) as e:
         return HeartbeatResult(False, [Diagnostic("D000", "invariant-query-failed", str(e))],
                                 (), EXIT_QUERY_FAILED)
 
-    quiet = len(diags) == 0 and first_pass == second_pass
-    if not quiet and len(diags) == 0:
+    if not diags and first_pass != second_pass:
         # Predicate changed between passes with no diagnostic cause: treat as
         # a query-failure-class condition rather than ever claiming silence.
         diags = [Diagnostic("D000", "predicate-unstable-across-passes",
                              f"{first_pass} != {second_pass}")]
+    all_zero = all(v == 0 for v in first_pass) and all(v == 0 for v in second_pass)
+    quiet = not diags and first_pass == second_pass and all_zero
     exit_code = EXIT_QUIET if quiet else EXIT_DIAGNOSTICS
     return HeartbeatResult(quiet, diags, second_pass, exit_code)
